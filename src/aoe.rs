@@ -1,41 +1,14 @@
-use std::{fmt, process};
+use anyhow::{Context, Result};
+use std::process;
 
-pub trait AbortOnError<T>: Sized {
-    fn aoe(self) -> T;
-
-    fn aoe_msg(self, msg: impl fmt::Display) -> T;
+#[must_use]
+pub fn do_something() -> Result<()> {
+    Ok(())
 }
 
-impl<T, E> AbortOnError<T> for Result<T, E>
-where
-    E: fmt::Display,
-{
-    #[track_caller]
-    fn aoe(self) -> T {
-        match self {
-            Ok(value) => value,
-            Err(err) => panic!("Error: {}", err),
-        }
-    }
-
-    #[track_caller]
-    fn aoe_msg(self, msg: impl fmt::Display) -> T {
-        match self {
-            Ok(value) => value,
-            Err(err) => panic!("{}: {}", msg, err),
-        }
-    }
-}
-
-pub fn register() {
-    std::panic::set_hook(Box::new(|info| {
-        let msg = info.payload().downcast_ref::<String>();
-        let loc = info.location();
-        if let (Some(msg), Some(loc)) = (msg, loc) {
-            eprintln!("[{}:{}:{}] {}", loc.file(), loc.line(), loc.column(), msg);
-        } else {
-            eprintln!("{}", info)
-        }
+pub fn main() {
+    if let Err(err) = std::panic::catch_unwind(|| do_something()) {
+        eprintln!("Error: {:?}", err);
         process::exit(1);
-    }));
+    }
 }

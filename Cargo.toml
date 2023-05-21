@@ -16,7 +16,7 @@ serde = { version = "1.0", features = ["derive"] }
 zip = { version = "0.5", default-features = false, features = ["deflate"] }
 
 [target.'cfg(windows)'.build-dependencies]
-winres = "0.1"
+winres = "0.1.12"
 
 [package.metadata.winres]
 OriginalFilename = "mcl-installer.exe"
@@ -26,8 +26,8 @@ ProductName = "iTXTech MCL Installer"
 ProductVersion = "1.0.0.0"
 
 [profile.release]
-opt-level = 'z'
-lto = true
-panic = "abort"
+opt-level = "z"
+lto = "fat"
+split-debuginfo = "packed"
 codegen-units = 1
-strip = "symbols"
+panic = "abort"

@@ -3,16 +3,22 @@ mod aoe;
 use self::aoe::AbortOnError;
 
 use std::collections::HashMap;
+use std::env;
 use std::fmt::format;
 use std::fs;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::option::Option::Some;
-use std::path::Path;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+use anyhow::{Context, Result};
 use reqwest::{Client, Error, Response};
 use serde::Deserialize;
+use tokio::io::AsyncWriteExt;
+use indicatif::ProgressBar;
+use tokio::task;
+use tokio::sync::Mutex;
 use zip::ZipArchive;
 
 const MIRAI_REPO: &str = "mirai.mamoe.net/assets/mcl";
@@ -56,110 +62,122 @@ struct RepoInfo {
     metadata: Option<String>,
 }
 
+#[inline]
 fn str_to_int(s: &str) -> i32 {
-    s.trim().parse::<i32>().unwrap_or(0)
+    s.trim().parse::<i32>().expect("invalid number")
+}
+
+use lazy_static::lazy_static;
+lazy_static! {
+    static ref BUF: String = String::new();
 }
 
 fn read_line() -> String {
-    let mut buf = String::new();
-    io::stdout().flush().aoe();
-    io::stdin().read_line(&mut buf).aoe();
-    buf
+    io::stdout().flush().expect("flush failed");
+    io::stdin().read_line(&mut BUF).expect("read_line failed");
+    BUF.clone()
 }
 
-async fn get(client: &Client, str: &str) -> Result<Response, Error> {
-    return client.get(str)
-        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/88.0.4324.104 Safari/537.36")
-        .send()
-        .await;
+async fn get(client: &Mutex<Client>, str: &str) -> Result<Response, Error> {
+    let client = client.lock().await.clone();
+    tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            client.get(str)
+                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/113.0.5672.127 Safari/537.36")
+                .send()
+                .await?
+        })
+        .await??
+    })
+    .await??
 }
+async fn unzip(path: &str) -> String {
+    let result = task::spawn_blocking(move || {
+        let mut zip = ZipExtract::new(path)?;
+        zip.progress(|progress| {
+            println!("Extracting {}%", progress);
+        });
+        zip.extract()?;
+        let zip_file0 =  zip.zip _archive().by_index(0)?;
+        zip_file0.name().to_owned()
+    })
+    .await??;
 
-fn unzip(path: &str) -> String {
-    let mut zip = ZipArchive::new(File::open(path).aoe()).aoe();
-
-    let len = zip.len();
-    for i in 0..zip.len() {
-        let mut file = zip.by_index(i).aoe();
-        let outpath = match file.enclosed_name() {
-            Some(path) => path.to_owned(),
-            None => continue,
-        };
-
-        print!("\rExtracting [{}/{}] {}", i + 1, len, file.name());
-        if (&*file.name()).ends_with('/') {
-            fs::create_dir_all(&outpath).aoe();
-        } else {
-            if let Some(p) = outpath.parent() {
-                if !p.exists() {
-                    fs::create_dir_all(&p).aoe();
-                }
-            }
-            let mut outfile = File::create(&outpath).aoe();
-            io::copy(&mut file, &mut outfile).aoe();
-        }
-    }
-    println!();
-
-    let zip_file0 = zip.by_index(0).aoe();
-    zip_file0.name().to_owned()
+    result
 }
 
 async fn download(client: &Client, url: &str, file: &str) {
     println!("Start Downloading: {}", url);
 
-    let mut res = get(&client, &url).await.aoe();
-    let ttl = res
+    let res = client.head(url).send().await.aoe();
+    let content_length = res
         .headers()
         .get(reqwest::header::CONTENT_LENGTH)
         .unwrap()
         .to_str()
         .aoe();
-    let total = str_to_int(ttl);
+    let total = str_to_int(content_length);
+
+    let pb = ProgressBar::new(total as u64);
+    pb.set_style(indicatif::ProgressStyle::default_bar()
+        .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
+        .progress_chars("#>-"));
+
+    let mut file = File::create(file).await.aoe();
+
     let mut current = 0;
-    let _ = fs::remove_file(file);
+    while current < total {
+        let range_header = format!("bytes={}-{}", current, current + 10240 - 1);
+        let range_value = HeaderValue::from_str(&range_header).aoe();
+        let res = client.get(url).header(RANGE, range_value).send().await.aoe();
 
-    {
-        let mut file = File::create(file).aoe();
-
-        while let Some(chunk) = res.chunk().await.aoe() {
-            current += chunk.len();
-            file.write_all(&*chunk).aoe();
-            print!("\rDownloading: {}/{}", current, total);
-        }
-
-        println!();
+        let chunk = res.bytes().await.aoe();
+        file.write_all(&*chunk).await.aoe();
+        current += chunk.len();
+        pb.set_position(current as u64);
     }
+
+    pb.finish_with_message("Download completed");
 }
 
-fn get_canonical_path(p: &str) -> String {
-    let p = Path::new(p).canonicalize().aoe();
-    let path = p.to_str().expect("expected utf-8 path");
+fn get_canonical_path(p: &str) -> PathBuf {
+    let p = PathBuf::from(p).canonicalize().aoe();
     #[cfg(windows)]
-    return format!("{}", &path[4..path.len()]);
+    return p.strip_prefix(r"\\?\").aoe();
     #[cfg(unix)]
-    return path.to_string();
+    return p;
 }
 
-fn find_java() -> String {
-    if !Path::new("./java").exists() {
-        return "java".to_string();
-    }
-    let j = get_canonical_path("java");
-    #[cfg(target_os = "windows")]
-    return format!("{}\\bin\\java.exe", j);
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    return format!("{}/bin/java", j);
-    #[cfg(target_os = "macos")]
-    return format!("{}/Contents/Home/bin/java", j);
-}
-
-fn exec(cmd: &mut Command, msg: &str) {
-    if let Ok(status) = cmd.spawn().and_then(|mut c| c.wait()) {
-        if status.success() {
-            return;
+fn find_java() -> PathBuf {
+    if PathBuf::from("./java").exists() {
+        let j = get_canonical_path("java");
+        #[cfg(target_os = "windows")]
+        return j.join("bin/java.exe");
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        return j.join("bin/java");
+        #[cfg(target_os = "macos")]
+        return j.join("Contents/Home/bin/java");
+    } else {
+        if let Some(j) = env::var_os("JAVA_HOME") {
+            let j = PathBuf::from(j);
+            #[cfg(target_os = "windows")]
+            return j.join("bin/java.exe");
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            return j.join("bin/java");
+            #[cfg(target_os = "macos")]
+            return j.join("Contents/Home/bin/java");
+        } else {
+            return PathBuf::from("java");
         }
     }
-    println!("Error occurred while {}", msg);
+}
+
+fn exec(cmd: &mut Command, msg: &str) -> Result<()> {
+    let status = cmd.status().context(format!("while {}", msg))?;
+    if !status.success() {
+        anyhow::bail!("command exited with status {}", status);
+    }
+    Ok(())
 }
 
 #[tokio::main]
